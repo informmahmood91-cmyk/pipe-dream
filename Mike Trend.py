@@ -148,15 +148,270 @@ class MIKACompressor:
                 else "CAUTION")
         return RegimeInfo(regime, mode, confidence, adx, bb_width, atr_pct)
 
-    # --------------------------------------------
-    # All _analyze_* methods (RSI, Stochastic, MACD, Bollinger, EMA, VWAP, Pivot, Structure, Volume, ADX_DI, Ichimoku, VolumeProfile)
-    # They are identical to what you have – I'll include the full versions below.
-    # (I've copied them from your provided file – they are exactly the same.)
-    # To keep this answer manageable, I'll include them as a block at the end.
-    # For now, I'll paste the remaining methods.
-    # (The actual code will have all methods – I'll assume you have them.)
+    def _analyze_rsi(self, regime: RegimeInfo) -> IndicatorResult:
+        rsi_raw = self.twelve_data.get("rsi")
+        rsi = self._sf(rsi_raw, 50.0)
+        is_missing = self._is_missing(rsi_raw)
+        signal = "NEUTRAL"
+        weight = 0.60
+        if not is_missing:
+            if regime.regime in ("BULL_TREND", "BEAR_TREND"):
+                if regime.regime == "BULL_TREND":
+                    if rsi > self.RSI_TRENDING_MIDLINE:
+                        signal, weight = "BULLISH", 0.85
+                    elif rsi < (100 - self.RSI_TRENDING_MIDLINE):
+                        signal, weight = "BEARISH", 0.85
+                else:
+                    if rsi < self.RSI_TRENDING_MIDLINE:
+                        signal, weight = "BEARISH", 0.85
+                    elif rsi > (100 - self.RSI_TRENDING_MIDLINE):
+                        signal, weight = "BULLISH", 0.85
+            elif regime.regime == "RANGING":
+                if rsi < self.RSI_OVERSOLD:  signal = "BULLISH"
+                elif rsi > self.RSI_OVERBOUGHT: signal = "BEARISH"
+            else:
+                if rsi < self.RSI_OVERSOLD:  signal = "BULLISH"
+                elif rsi > self.RSI_OVERBOUGHT: signal = "BEARISH"
+        return IndicatorResult("RSI", "MOMENTUM", signal, weight, {"value": rsi}, is_missing)
 
-    # ... (paste all _analyze_* methods here – from your file) ...
+    def _analyze_stochastic(self, regime: RegimeInfo) -> IndicatorResult:
+        k_raw = self.twelve_data.get("stoch_k")
+        d_raw = self.twelve_data.get("stoch_d")
+        k = self._sf(k_raw, 50.0)
+        d = self._sf(d_raw, k)
+        is_missing = self._is_missing(k_raw) or self._is_missing(d_raw)
+        signal, weight = "NEUTRAL", 0.55
+        if not is_missing:
+            if regime.mode == "MEAN_REVERT":
+                if k < self.STOCH_OVERSOLD:  signal, weight = "BULLISH", 0.65
+                elif k > self.STOCH_OVERBOUGHT: signal, weight = "BEARISH", 0.65
+            else:
+                if k > 50 and k > d:   signal = "BULLISH"
+                elif k < 50 and k < d: signal = "BEARISH"
+        return IndicatorResult("STOCHASTIC", "MOMENTUM", signal, weight, {"k": k, "d": d}, is_missing)
+
+    def _analyze_macd(self, regime: RegimeInfo) -> IndicatorResult:
+        hist_raw = self.twelve_data.get("macd_histogram")
+        line_raw = self.twelve_data.get("macd")
+        sig_raw  = self.twelve_data.get("macd_signal")
+        hist = self._sf(hist_raw, 0.0)
+        line = self._sf(line_raw, 0.0)
+        sig  = self._sf(sig_raw, 0.0)
+        is_missing = self._is_missing(hist_raw) or self._is_missing(line_raw) or self._is_missing(sig_raw)
+        signal = "NEUTRAL"
+        if not is_missing:
+            if hist > 0 and line > sig:   signal = "BULLISH"
+            elif hist < 0 and line < sig: signal = "BEARISH"
+        return IndicatorResult("MACD", "MOMENTUM", signal, 0.85, {"hist": hist}, is_missing)
+
+    def _analyze_bollinger_bands(self, regime: RegimeInfo) -> IndicatorResult:
+        price    = self._sf(self.tv_data.get("price"), 0.0)
+        bb_upper_raw = self.twelve_data.get("bb_upper")
+        bb_lower_raw = self.twelve_data.get("bb_lower")
+        bb_width_raw = self.twelve_data.get("bb_width")
+        bb_upper = self._sf(bb_upper_raw, 0.0)
+        bb_lower = self._sf(bb_lower_raw, 0.0)
+        bb_width = self._sf(bb_width_raw, 100.0)
+        is_missing = self._is_missing(bb_upper_raw) or self._is_missing(bb_lower_raw)
+        signal = "NEUTRAL"
+        if not is_missing and price > 0:
+            if regime.mode == "MEAN_REVERT":
+                if bb_lower > 0 and price <= bb_lower * 1.02: signal = "BULLISH"
+                elif bb_upper > 0 and price >= bb_upper * 0.98: signal = "BEARISH"
+            else:
+                if bb_upper > 0 and price > bb_upper: signal = "BULLISH"
+                elif bb_lower > 0 and price < bb_lower: signal = "BEARISH"
+        return IndicatorResult("BOLLINGER", "VOLATILITY", signal, 0.85,
+                               {"bb_width": bb_width}, is_missing)
+
+    def _analyze_ema(self, regime: RegimeInfo) -> IndicatorResult:
+        e21_raw = self.tv_data.get("ema_21")
+        e50_raw = self.tv_data.get("ema_50")
+        e200_raw = self.tv_data.get("ema_200")
+        e21   = self._sf(e21_raw, 0.0)
+        e50   = self._sf(e50_raw, 0.0)
+        e200  = self._sf(e200_raw, 0.0)
+        align = self._ss(self.tv_data.get("ema_align"), "")
+        slope = self._ss(self.tv_data.get("ema_slope"), "").upper()
+        is_missing = self._is_missing(e21_raw) or self._is_missing(e50_raw) or self._is_missing(e200_raw)
+        signal, weight = "NEUTRAL", 0.85
+        if not is_missing:
+            if e21 > e50 > e200:   signal = "BULLISH"
+            elif e21 < e50 < e200: signal = "BEARISH"
+            if align == "BULL":    signal = "BULLISH"
+            elif align == "BEAR":  signal = "BEARISH"
+            slope_confirms = ((signal == "BULLISH" and slope == "UP") or
+                              (signal == "BEARISH" and slope == "DOWN"))
+            if slope_confirms:
+                weight = min(1.0, weight + self.EMA_SLOPE_WEIGHT_BONUS)
+            elif ((signal == "BULLISH" and slope == "DOWN") or
+                  (signal == "BEARISH" and slope == "UP")):
+                weight = max(0.50, weight - self.EMA_SLOPE_WEIGHT_BONUS)
+        return IndicatorResult("EMA", "TREND", signal, weight, {"slope": slope}, is_missing)
+
+    def _analyze_vwap(self, regime: RegimeInfo) -> IndicatorResult:
+        price      = self._sf(self.tv_data.get("price"), 0.0)
+        w_vwap_raw = self.tv_data.get("weekly_vwap")
+        m_vwap_raw = self.tv_data.get("monthly_vwap")
+        pvwap      = self._ss(self.tv_data.get("price_vs_vwap"), "")
+        w_vwap = self._sf(w_vwap_raw, 0.0)
+        m_vwap = self._sf(m_vwap_raw, 0.0)
+        is_missing = self._is_missing(w_vwap_raw) or self._is_missing(m_vwap_raw)
+        signal, weight, confirm = "NEUTRAL", 0.85, 0
+        if pvwap == "ABOVE":   signal = "BULLISH"; confirm += 1
+        elif pvwap == "BELOW": signal = "BEARISH"; confirm += 1
+        if not self._is_missing(w_vwap_raw) and w_vwap > 0:
+            confirm += 1 if (price > w_vwap) == (signal == "BULLISH") else -1
+        if not self._is_missing(m_vwap_raw) and m_vwap > 0:
+            confirm += 1 if (price > m_vwap) == (signal == "BULLISH") else -1
+        if confirm >= 2:
+            weight = 0.90
+        elif confirm <= -2:
+            weight = 0.90
+            signal = "BEARISH" if signal == "BULLISH" else "BULLISH"
+        return IndicatorResult("VWAP", "STRUCTURE", signal, weight,
+                               {"confirmation": confirm}, is_missing)
+
+    def _analyze_pivot(self, regime: RegimeInfo) -> IndicatorResult:
+        price   = self._sf(self.tv_data.get("price"), 0.0)
+        pivot_raw = self.tv_data.get("weekly_pivot")
+        r1_raw = self.tv_data.get("weekly_r1")
+        s1_raw = self.tv_data.get("weekly_s1")
+        pivot   = self._sf(pivot_raw, 0.0)
+        r1      = self._sf(r1_raw, 0.0)
+        s1      = self._sf(s1_raw, 0.0)
+        nearest = self._ss(self.tv_data.get("nearest_level"), "")
+        is_missing = self._is_missing(pivot_raw)
+        signal  = "NEUTRAL"
+        if not is_missing and pivot > 0:
+            if price > pivot:
+                signal = "BULLISH"
+            elif price < pivot:
+                signal = "BEARISH"
+            else:
+                signal = "NEUTRAL"
+            if nearest in ("R1", "R2", "R3") and r1 > 0 and price <= r1 * 1.01:
+                signal = "BEARISH"
+            elif nearest in ("S1", "S2", "S3") and s1 > 0 and price >= s1 * 0.99:
+                signal = "BULLISH"
+        return IndicatorResult("PIVOT", "STRUCTURE", signal, 0.60,
+                               {"nearest": nearest}, is_missing)
+
+    def _analyze_structure(self, regime: RegimeInfo) -> IndicatorResult:
+        bias      = self._ss(self.tv_data.get("structure_bias"), "")
+        hh_hl     = self._ss(self.tv_data.get("hh_hl_pred"), "")
+        fail_up   = self._sb(self.tv_data.get("lon_fail_up"))   or self._sb(self.tv_data.get("ny_fail_up"))
+        fail_down = self._sb(self.tv_data.get("lon_fail_down")) or self._sb(self.tv_data.get("ny_fail_down"))
+        is_missing = self._is_missing(self.tv_data.get("structure_bias"))
+        signal, weight = "NEUTRAL", 1.0
+        if bias == "BULL":   signal = "BULLISH"
+        elif bias == "BEAR": signal = "BEARISH"
+        if hh_hl in ("HH", "HL"):
+            if signal == "NEUTRAL": signal = "BULLISH"
+            elif signal == "BEARISH": signal = "NEUTRAL"
+        elif hh_hl == "LL":
+            if signal == "NEUTRAL": signal = "BEARISH"
+            elif signal == "BULLISH": signal = "NEUTRAL"
+        both_confirmed = (bias in ("BULL", "BEAR") and
+                          hh_hl in ("HH", "HL", "LL") and
+                          signal != "NEUTRAL")
+        if fail_up and not fail_down:
+            if signal == "BULLISH" and both_confirmed: weight = 0.70
+            else: signal = "BEARISH"
+        elif fail_down and not fail_up:
+            if signal == "BEARISH" and both_confirmed: weight = 0.70
+            else: signal = "BULLISH"
+        return IndicatorResult("STRUCTURE", "STRUCTURE", signal, weight,
+                               {"bias": bias}, is_missing)
+
+    def _analyze_volume(self, regime: RegimeInfo) -> IndicatorResult:
+        vol_ratio_raw = self.tv_data.get("volume_ratio")
+        vol_ratio  = self._sf(vol_ratio_raw, 1.0)
+        raw_signal = self._sf(self.tv_data.get("raw_signal"), 0.0)
+        is_missing = self._is_missing(vol_ratio_raw)
+        signal     = "NEUTRAL"
+        if not is_missing:
+            if vol_ratio > self.VOLUME_HIGH_RATIO:
+                signal = "BULLISH" if raw_signal > 0 else "BEARISH" if raw_signal < 0 else "NEUTRAL"
+            elif vol_ratio < self.VOLUME_LOW_RATIO:
+                signal = "NEUTRAL"
+        return IndicatorResult("VOLUME", "VOLUME", signal, 0.70,
+                               {"ratio": vol_ratio}, is_missing)
+
+    def _analyze_adx_di(self, regime: RegimeInfo) -> IndicatorResult:
+        adx_raw = self.tv_data.get("adx")
+        diplus_raw = self.tv_data.get("diplus")
+        diminus_raw = self.tv_data.get("diminus")
+        adx     = self._sf(adx_raw, 0.0)
+        diplus  = self._sf(diplus_raw, 0.0)
+        diminus = self._sf(diminus_raw, 0.0)
+        is_missing = self._is_missing(adx_raw) or self._is_missing(diplus_raw) or self._is_missing(diminus_raw)
+        signal  = "NEUTRAL"
+        weight  = 0.85 if adx >= self.ADX_RANGE_THRESHOLD else 0.50
+        if not is_missing and diplus > diminus > 0:  signal = "BULLISH"
+        elif not is_missing and diminus > diplus > 0: signal = "BEARISH"
+        return IndicatorResult("ADX_DI", "TREND", signal, weight, {"adx": adx}, is_missing)
+
+    def _analyze_ichimoku(self, regime: RegimeInfo) -> IndicatorResult:
+        price = self._sf(self.tv_data.get("price"), 0.0)
+        conv_raw = self.twelve_data.get("ichimoku_conversion")
+        if self._is_missing(conv_raw):
+            conv_raw = self.tv_data.get("ichimoku_conversion")
+        base_raw = self.twelve_data.get("ichimoku_base")
+        if self._is_missing(base_raw):
+            base_raw = self.tv_data.get("ichimoku_base")
+        span_a_raw = self.twelve_data.get("ichimoku_span_a")
+        if self._is_missing(span_a_raw):
+            span_a_raw = self.tv_data.get("ichimoku_span_a")
+        span_b_raw = self.twelve_data.get("ichimoku_span_b")
+        if self._is_missing(span_b_raw):
+            span_b_raw = self.tv_data.get("ichimoku_span_b")
+
+        conv   = self._sf(conv_raw, 0.0)
+        base   = self._sf(base_raw, 0.0)
+        span_a = self._sf(span_a_raw, 0.0)
+        span_b = self._sf(span_b_raw, 0.0)
+
+        has_conv_base = (conv > 0 and base > 0)
+        has_span = (span_a > 0 and span_b > 0)
+        is_missing = (not has_conv_base) and (not has_span)
+
+        signal = "NEUTRAL"
+        weight = 0.60
+        if has_conv_base:
+            if price > conv and price > base:
+                signal = "BULLISH"
+            elif price < conv and price < base:
+                signal = "BEARISH"
+        if has_span:
+            if span_a > span_b and price > span_a:
+                weight = 0.85
+            elif span_b > span_a and price < span_a:
+                weight = 0.85
+        return IndicatorResult("ICHIMOKU", "TREND", signal, weight, {}, is_missing)
+
+    def _analyze_volume_profile(self, regime: RegimeInfo) -> IndicatorResult:
+        above_vah_raw = self.tv_data.get("price_above_vah")
+        below_val_raw = self.tv_data.get("price_below_val")
+        price_at_poc_raw = self.tv_data.get("price_at_poc")
+        above_vah   = self._sb(above_vah_raw)
+        below_val   = self._sb(below_val_raw)
+        price_at_poc = self._sb(price_at_poc_raw)
+        is_missing = (self._is_missing(above_vah_raw) or self._is_missing(below_val_raw))
+        signal, weight = "NEUTRAL", 0.85
+        if not is_missing:
+            if regime.regime == "BULL_TREND":
+                if below_val:   signal = "BULLISH"
+                elif above_vah: signal = "BULLISH"
+            elif regime.regime == "BEAR_TREND":
+                if above_vah:   signal = "BEARISH"
+                elif below_val: signal = "BEARISH"
+            else:
+                if below_val:   signal = "BULLISH"
+                elif above_vah: signal = "BEARISH"
+            if price_at_poc:
+                signal, weight = "NEUTRAL", 0.90
+        return IndicatorResult("VOLUME_PROFILE", "STRUCTURE", signal, weight, {}, is_missing)
 
     def _volume_institutional(self, regime: RegimeInfo) -> Dict[str, Any]:
         vol = self._sf(self.tv_data.get("volume_ratio"), 1.0)
@@ -712,9 +967,9 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
     adx = adx_series.iloc[-1] if not adx_series.empty else 0
     diplus = diplus_series.iloc[-1] if not diplus_series.empty else 0
     diminus = diminus_series.iloc[-1] if not diminus_series.empty else 0
-    for v in (adx, diplus, diminus):
-        if isinstance(v, float) and math.isnan(v):
-            v = 0
+    if isinstance(adx, float) and math.isnan(adx): adx = 0
+    if isinstance(diplus, float) and math.isnan(diplus): diplus = 0
+    if isinstance(diminus, float) and math.isnan(diminus): diminus = 0
 
     # Stochastic
     low14 = low.rolling(window=14).min()
