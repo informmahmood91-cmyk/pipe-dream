@@ -686,7 +686,7 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
         ema_align = "N/A"
         structure_bias = "N/A"
 
-    # ADX (simplified but works)
+    # ADX (Wilder's, vectorized)
     high_shift = high.shift(1)
     low_shift = low.shift(1)
     tr1 = high - low
@@ -694,26 +694,27 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
     tr3 = (low - low_shift).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
+
     plus_dm = pd.Series(index=high.index, dtype=float)
     minus_dm = pd.Series(index=high.index, dtype=float)
     for i in range(1, len(high)):
         up = high.iloc[i] - high.iloc[i-1]
         down = low.iloc[i-1] - low.iloc[i]
-        if up > down and up > 0:
-            plus_dm.iloc[i] = up
-        else:
-            plus_dm.iloc[i] = 0.0
-        if down > up and down > 0:
-            minus_dm.iloc[i] = down
-        else:
-            minus_dm.iloc[i] = 0.0
-    atr_14 = atr.tail(14).mean()
-    diplus = (plus_dm.rolling(14).mean() / atr_14 * 100).iloc[-1] if atr_14 != 0 else 0
-    diminus = (minus_dm.rolling(14).mean() / atr_14 * 100).iloc[-1] if atr_14 != 0 else 0
-    dx = abs(diplus - diminus) / (diplus + diminus) * 100 if (diplus + diminus) != 0 else 0
-    adx = dx.rolling(14).mean().iloc[-1] if not dx.empty else 0
-    for v in [adx, diplus, diminus]:
-        if math.isnan(v): v = 0
+        plus_dm.iloc[i] = up if (up > down and up > 0) else 0.0
+        minus_dm.iloc[i] = down if (down > up and down > 0) else 0.0
+
+    diplus_series = (plus_dm.rolling(14).mean() / atr.replace(0, np.nan) * 100)
+    diminus_series = (minus_dm.rolling(14).mean() / atr.replace(0, np.nan) * 100)
+    di_sum = (diplus_series + diminus_series).replace(0, np.nan)
+    dx_series = (diplus_series - diminus_series).abs() / di_sum * 100
+    adx_series = dx_series.rolling(14).mean()
+
+    adx = adx_series.iloc[-1] if not adx_series.empty else 0
+    diplus = diplus_series.iloc[-1] if not diplus_series.empty else 0
+    diminus = diminus_series.iloc[-1] if not diminus_series.empty else 0
+    for v in (adx, diplus, diminus):
+        if isinstance(v, float) and math.isnan(v):
+            v = 0
 
     # Stochastic
     low14 = low.rolling(window=14).min()
