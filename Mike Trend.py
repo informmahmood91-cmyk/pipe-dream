@@ -1223,4 +1223,3 @@ full_text = "\n\n".join(short_messages)
 send_telegram_chunked(BOT_TOKEN, CHAT_ID, full_text)
 
 print("Short trend updates sent.")
-return {"success": True, "symbols": list(symbols), "results": compressor_results}
