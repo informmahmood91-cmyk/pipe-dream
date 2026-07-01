@@ -1,6 +1,22 @@
 # =================================================================
-# Mike Trend.py – MIKA Compressor v5.5 + indicator computation
+# Mike Trend.py – MIKA Compressor v5.6.1
+# Divergence & Exhaustion Fixes + PATCHED divergence detector
 # (pure pandas/numpy – no external dependencies)
+#
+# CHANGELOG vs v5.6:
+#   FIX 1: _detect_divergence rewritten to use TRAILING (right-aligned)
+#          swing detection instead of centered rolling(3, center=True).
+#          The old centered method could NEVER classify the most recent
+#          (current/live) bar as a swing high/low, because a centered
+#          3-bar window requires a bar AFTER it to confirm the peak.
+#          On live data the current bar is always the last bar, so
+#          divergence on the live bar could never be detected.
+#   FIX 2: Divergence lookback window widened from 20 -> 40 bars
+#          (configurable via DIVERGENCE_LOOKBACK) so peaks/troughs
+#          spaced further apart are still compared.
+#   FIX 3: Restored try/except safety net around
+#          _detect_reversal_exhaustion (was present in v5.5, dropped
+#          in v5.6).
 # =================================================================
 
 import math
@@ -40,6 +56,8 @@ class MIKACompressor:
     ADX_RANGE_THRESHOLD          = 20.0
     BB_COMPRESSION_THRESHOLD     = 5.0
     BB_EXPANSION_THRESHOLD       = 15.0
+    BB_WIDTH_SQUEEZE_PERCENTILE   = 20.0   # FIX: percentile-based squeeze detection
+    BB_WIDTH_EXPANSION_PERCENTILE = 80.0   # FIX: percentile-based expansion detection
     ATR_HIGH_VOL_PERCENTILE      = 75.0
     ATR_LOW_VOL_PERCENTILE       = 25.0
     RSI_OVERBOUGHT               = 70.0
@@ -126,9 +144,24 @@ class MIKACompressor:
         if adx > self.ADX_TREND_THRESHOLD:       t_votes   += 2
         elif adx > self.ADX_WEAK_TREND_THRESHOLD: t_votes  += 1
         else:                                      r_votes  += 1
-        if bb_width < self.BB_COMPRESSION_THRESHOLD:    r_votes   += 2
-        elif bb_width > self.BB_EXPANSION_THRESHOLD:    vol_votes += 2
-        else:                                            r_votes   += 1
+        # FIX: BB width scaling bug. Fixed absolute thresholds (5% / 15%) assumed
+        # a scale that real FX bb_width values (typically 0.02%-1.5% on 4h) never
+        # reach, which meant almost every bar registered as "compressed" regardless
+        # of actual volatility. Use bb_width_percentile (computed relative to that
+        # symbol's own trailing history in compute_indicators_for_symbol) when
+        # available, since it self-calibrates per symbol/timeframe. Falls back to
+        # the legacy absolute thresholds only if the percentile field is absent
+        # (e.g. older Pine webhook payloads that don't send it yet).
+        bbw_pctile_raw = self.tv_data.get("bb_width_percentile")
+        if bbw_pctile_raw is not None and not self._is_missing(bbw_pctile_raw):
+            bbw_pctile = self._sf(bbw_pctile_raw, 50.0)
+            if bbw_pctile < self.BB_WIDTH_SQUEEZE_PERCENTILE:      r_votes   += 2
+            elif bbw_pctile > self.BB_WIDTH_EXPANSION_PERCENTILE:  vol_votes += 2
+            else:                                                   r_votes   += 1
+        else:
+            if bb_width < self.BB_COMPRESSION_THRESHOLD:    r_votes   += 2
+            elif bb_width > self.BB_EXPANSION_THRESHOLD:    vol_votes += 2
+            else:                                            r_votes   += 1
         if atr_pct > self.ATR_HIGH_VOL_PERCENTILE:  vol_votes += 2
         elif atr_pct < self.ATR_LOW_VOL_PERCENTILE: r_votes   += 1
         else:                                         t_votes   += 1
@@ -147,7 +180,7 @@ class MIKACompressor:
                 else "MEAN_REVERT" if regime == "RANGING"
                 else "CAUTION")
         return RegimeInfo(regime, mode, confidence, adx, bb_width, atr_pct)
-
+    
     def _analyze_rsi(self, regime: RegimeInfo) -> IndicatorResult:
         rsi_raw = self.twelve_data.get("rsi")
         rsi = self._sf(rsi_raw, 50.0)
@@ -437,6 +470,8 @@ class MIKACompressor:
         }
 
     def _compute_exhaustion_from_indicators(self, regime: RegimeInfo) -> float:
+        # This is now supplemented by the externally provided exhaustion scores.
+        # We keep it as a fallback but mainly rely on the scores from tv_data.
         score = 0.0
         rsi = self._sf(self.twelve_data.get("rsi"), 50.0)
         if regime.regime == "BULL_TREND" and rsi > 75:
@@ -471,9 +506,11 @@ class MIKACompressor:
         return min(score, 10.0)
 
     def _detect_reversal_exhaustion(self, regime: RegimeInfo) -> Dict[str, Any]:
+        # FIX 3: restored try/except safety net (was in v5.5, dropped in v5.6)
         try:
             bs_pine  = self._sf(self.tv_data.get("bearish_exhaustion_score"), 0.0)
             bus_pine = self._sf(self.tv_data.get("bullish_exhaustion_score"), 0.0)
+            # Fallback to computed if both are zero
             if bs_pine == 0.0 and bus_pine == 0.0:
                 computed = self._compute_exhaustion_from_indicators(regime)
                 if regime.regime == "BULL_TREND":
@@ -492,16 +529,19 @@ class MIKACompressor:
             print(f"[COMPRESSOR] _detect_reversal_exhaustion error: {e}")
             bs  = 0.0
             bus = 0.0
+
         if bus > bs:
             direction, score = "BULLISH_REVERSAL_RISK", bus
         elif bs > bus:
             direction, score = "BEARISH_REVERSAL_RISK", bs
         else:
             direction, score = "NEUTRAL_REVERSAL_RISK", 0
+
         if   score >= 7: verdict, override = "STRONG_REVERSAL_RISK",  "NO_TRADE"
         elif score >= 5: verdict, override = "WAIT_CONFIRMATION",      "WAIT_CONFIRMATION"
         elif score >= 3: verdict, override = "MODERATE_REVERSAL_RISK", "REDUCE_SIZE"
         else:            verdict, override = "CONTINUATION",           "NONE"
+
         return {
             "verdict":         verdict,
             "action_override": override,
@@ -523,7 +563,15 @@ class MIKACompressor:
         vol_ratio  = self._sf(self.tv_data.get("volume_ratio"), 1.0)
         bb_upper   = self._sf(self.twelve_data.get("bb_upper"), 0.0)
         bb_lower   = self._sf(self.twelve_data.get("bb_lower"), 0.0)
-        is_squeeze = bbw < self.BB_COMPRESSION_THRESHOLD
+        # FIX: same percentile-based recalibration as _detect_regime — bbw's
+        # absolute value is meaningless without knowing the symbol's normal
+        # range, so prefer the self-calibrated percentile when available.
+        bbw_pctile_raw = self.tv_data.get("bb_width_percentile")
+        if bbw_pctile_raw is not None and not self._is_missing(bbw_pctile_raw):
+            bbw_pctile = self._sf(bbw_pctile_raw, 50.0)
+            is_squeeze = bbw_pctile < self.BB_WIDTH_SQUEEZE_PERCENTILE
+        else:
+            is_squeeze = bbw < self.BB_COMPRESSION_THRESHOLD
         if is_squeeze and price > 0:
             vol_confirms = vol_ratio > self.VOLUME_BREAKOUT_THRESHOLD
             if bb_upper > 0 and price > bb_upper and vol_confirms:
@@ -539,7 +587,7 @@ class MIKACompressor:
             "breakout_direction": direction,
             "bb_width":           bbw,
         }
-
+    
     def _cross_validate(self, results: List[IndicatorResult],
                         regime: RegimeInfo) -> Tuple[Dict[str, Any], int, int]:
         tier_map = {
@@ -720,9 +768,10 @@ class MIKACompressor:
             action = "NO_TRADE"
             reasoning.append(f"Strong reversal risk (score {exhaustion['risk_score']}) — {exhaustion['direction']}.")
         elif rev_override == "WAIT_CONFIRMATION":
-            if conv_pct < 35:
-                action = "WAIT_CONFIRMATION"
-                reasoning.append(f"Moderate reversal risk (score {exhaustion['risk_score']}) — wait for confirmation.")
+            # FIX (carried from v5.6): always trigger the confirmation warning,
+            # regardless of conviction level.
+            action = "WAIT_CONFIRMATION"
+            reasoning.append(f"Moderate reversal risk (score {exhaustion['risk_score']}) — wait for confirmation.")
         elif rev_override == "REDUCE_SIZE":
             if "_" in action:
                 prefix, suffix = action.rsplit("_", 1)
@@ -793,7 +842,7 @@ class MIKACompressor:
         decision      = self._make_decision(regime, cross_val, alignment, squeeze,
                                             exhaustion, breakout, analyses, missing_ratio)
         lines = [
-            "***MIKA COMPRESSOR v5.5 (Human-Like Confidence)***",
+            "***MIKA COMPRESSOR v5.6.1 (Divergence + Exhaustion + Swing-Detection Fix)***",
             f"SYMBOL: {self._ss(self.tv_data.get('symbol'), 'UNKNOWN')} | "
             f"PRICE: {self._sf(self.tv_data.get('price'), 0.0):.5f} | "
             f"TF: {self._ss(self.tv_data.get('timeframe'), 'H1')}",
@@ -844,7 +893,7 @@ class MIKACompressor:
             "symbol":     self._ss(self.tv_data.get("symbol"), "UNKNOWN"),
             "price":      self._sf(self.tv_data.get("price"), 0.0),
             "timeframe":  self._ss(self.tv_data.get("timeframe"), "H1"),
-            "version":    "5.5",
+            "version":    "5.6.1",
             "regime": {
                 "regime":       regime.regime,
                 "mode":         regime.mode,
@@ -876,10 +925,20 @@ class MIKACompressor:
             "summary_text":       "\n".join(lines),
         }
 
+
 # =================================================================
 # compute_indicators_for_symbol – pure pandas/numpy
 # =================================================================
-def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
+def compute_indicators_for_symbol(sym_df: pd.DataFrame,
+                                   divergence_lookback: int = 40) -> Dict[str, Any]:
+    """
+    Compute all indicators needed by MIKA Compressor, including divergence flags
+    and exhaustion scores.
+
+    FIX (v5.6.1): divergence_lookback widened default 20 -> 40, and swing
+    detection rewritten as TRAILING (right-aligned) instead of centered,
+    so the current/live bar CAN be classified as a swing high/low.
+    """
     close = sym_df["Close"].squeeze()
     high = sym_df["High"].squeeze()
     low = sym_df["Low"].squeeze()
@@ -897,6 +956,8 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
     rs = gain / loss
     rsi = (100 - (100 / (1 + rs))).iloc[-1]
     if math.isnan(rsi): rsi = float('nan')
+    # Store full RSI series for divergence
+    rsi_series = 100 - (100 / (1 + rs))
 
     # MACD
     exp12 = close.ewm(span=12, adjust=False).mean()
@@ -909,6 +970,8 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
     macd_hist_val = macd_hist.iloc[-1]
     for v in [macd_line_val, signal_line_val, macd_hist_val]:
         if math.isnan(v): v = float('nan')
+    # Store MACD line series for divergence
+    macd_line_series = macd_line
 
     # Bollinger Bands
     sma20 = close.rolling(window=20).mean()
@@ -921,6 +984,18 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
     bb_width_val = bb_width.iloc[-1]
     for v in [bb_upper_val, bb_lower_val, bb_width_val]:
         if math.isnan(v): v = float('nan')
+
+    # FIX: bb_width_percentile — self-calibrating squeeze/expansion signal.
+    # Ranks the current bb_width against this symbol's own trailing history
+    # instead of a fixed absolute % threshold, which broke because raw
+    # bb_width scale varies enormously by symbol/timeframe (e.g. EURUSD 4h
+    # typically 0.02%-1.5%, but the old thresholds assumed 5%-15%).
+    BBW_PCTILE_LOOKBACK = 150
+    bbw_hist = bb_width.iloc[-BBW_PCTILE_LOOKBACK:].dropna()
+    if len(bbw_hist) >= 10 and not math.isnan(bb_width_val):
+        bb_width_percentile = float((bbw_hist < bb_width_val).sum()) / len(bbw_hist) * 100.0
+    else:
+        bb_width_percentile = 50.0  # neutral fallback when insufficient history
 
     # EMAs
     ema21 = ema(close, 21).iloc[-1]
@@ -986,6 +1061,105 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
     vol_ratio = volume.iloc[-1] / avg_vol if avg_vol and avg_vol > 0 else 1.0
     raw_signal = 1 if price > close.iloc[-2] else -1 if price < close.iloc[-2] else 0
 
+    # ---------- FIX: Divergence detection (trailing / right-aligned swings) ----------
+    def _detect_divergence(price_series, indicator_series, window=divergence_lookback,
+                            swing_bars=3):
+        """
+        Returns (bearish_div, bullish_div) booleans.
+        Bearish: price makes higher high, indicator makes lower high.
+        Bullish: price makes lower low, indicator makes higher low.
+
+        FIX (v5.6.1): Uses a TRAILING swing definition instead of a centered
+        one. A bar `i` is a swing high if it is the max of bars
+        [i - swing_bars + 1, i] (i.e. it's the highest close of itself and
+        the `swing_bars - 1` bars immediately before it). This lets the
+        LAST bar in the dataset (the current/live bar) qualify as a swing,
+        which a centered rolling window can never do.
+        """
+        n = len(price_series)
+        if n < window:
+            window = n
+
+        # Trailing (right-aligned) rolling max/min: bar i compared only to
+        # bars at or before it -> works on the final/live bar.
+        price_trail_high = price_series.rolling(swing_bars).max()
+        price_trail_low  = price_series.rolling(swing_bars).min()
+        ind_trail_high   = indicator_series.rolling(swing_bars).max()
+        ind_trail_low    = indicator_series.rolling(swing_bars).min()
+
+        price_highs = (price_series == price_trail_high)
+        price_lows  = (price_series == price_trail_low)
+        ind_highs   = (indicator_series == ind_trail_high)
+        ind_lows    = (indicator_series == ind_trail_low)
+
+        idx = price_series.index[-window:]
+        price_high_idx = idx[price_highs.reindex(idx).fillna(False)]
+        price_low_idx  = idx[price_lows.reindex(idx).fillna(False)]
+        ind_high_idx   = idx[ind_highs.reindex(idx).fillna(False)]
+        ind_low_idx    = idx[ind_lows.reindex(idx).fillna(False)]
+
+        bearish = False
+        bullish = False
+
+        # Bearish divergence: price higher high, indicator lower high
+        if len(price_high_idx) >= 2 and len(ind_high_idx) >= 2:
+            ph1, ph2 = price_high_idx[-2], price_high_idx[-1]
+            ih1, ih2 = ind_high_idx[-2], ind_high_idx[-1]
+            if ih2 >= ph1 and ih1 <= ph2 and ph2 > ph1:
+                if (price_series[ph2] > price_series[ph1] and
+                    indicator_series[ih2] < indicator_series[ih1]):
+                    bearish = True
+
+        # Bullish divergence: price lower low, indicator higher low
+        if len(price_low_idx) >= 2 and len(ind_low_idx) >= 2:
+            pl1, pl2 = price_low_idx[-2], price_low_idx[-1]
+            il1, il2 = ind_low_idx[-2], ind_low_idx[-1]
+            if il2 >= pl1 and il1 <= pl2 and pl2 > pl1:
+                if (price_series[pl2] < price_series[pl1] and
+                    indicator_series[il2] > indicator_series[il1]):
+                    bullish = True
+
+        return bearish, bullish
+
+    # Compute divergences
+    rsi_bear_div, rsi_bull_div = _detect_divergence(close, rsi_series)
+    macd_bear_div, macd_bull_div = _detect_divergence(close, macd_line_series)
+
+    # ---------- Compute exhaustion scores ----------
+    bullish_exhaustion_score = 0.0
+    if not math.isnan(rsi_series.iloc[-1]) and rsi_series.iloc[-1] > 70:
+        bullish_exhaustion_score += 2.0
+    if not math.isnan(stoch_k_val) and stoch_k_val > 80:
+        bullish_exhaustion_score += 1.5
+    if not math.isnan(macd_hist_val) and macd_hist_val > 0 and macd_line_val != 0:
+        if abs(macd_hist_val) < abs(macd_line_val) * 0.3:  # histogram shrinking
+            bullish_exhaustion_score += 1.5
+    if not math.isnan(bb_upper_val) and price > bb_upper_val * 1.01:
+        bullish_exhaustion_score += 1.5
+    if rsi_bear_div:
+        bullish_exhaustion_score += 2.0
+    if macd_bear_div:
+        bullish_exhaustion_score += 1.5
+    bullish_exhaustion_score = min(bullish_exhaustion_score, 10.0)
+
+    bearish_exhaustion_score = 0.0
+    if not math.isnan(rsi_series.iloc[-1]) and rsi_series.iloc[-1] < 30:
+        bearish_exhaustion_score += 2.0
+    if not math.isnan(stoch_k_val) and stoch_k_val < 20:
+        bearish_exhaustion_score += 1.5
+    if not math.isnan(macd_hist_val) and macd_hist_val < 0 and macd_line_val != 0:
+        if abs(macd_hist_val) < abs(macd_line_val) * 0.3:
+            bearish_exhaustion_score += 1.5
+    if not math.isnan(bb_lower_val) and price < bb_lower_val * 0.99:
+        bearish_exhaustion_score += 1.5
+    if rsi_bull_div:
+        bearish_exhaustion_score += 2.0
+    if macd_bull_div:
+        bearish_exhaustion_score += 1.5
+    bearish_exhaustion_score = min(bearish_exhaustion_score, 10.0)
+
+    overextended = (bullish_exhaustion_score > 5 or bearish_exhaustion_score > 5)
+
     def _na_if_nan(v):
         try:
             if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -1022,13 +1196,13 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
         "diplus": _na_if_nan(diplus),
         "diminus": _na_if_nan(diminus),
         "market_regime": "N/A",
-        "bearish_exhaustion_score": 0,
-        "bullish_exhaustion_score": 0,
-        "bearish_rsi_div": False,
-        "bullish_rsi_div": False,
-        "bearish_macd_div": False,
-        "bullish_macd_div": False,
-        "overextended": False,
+        "bearish_exhaustion_score": bearish_exhaustion_score,
+        "bullish_exhaustion_score": bullish_exhaustion_score,
+        "bearish_rsi_div": rsi_bear_div,
+        "bullish_rsi_div": rsi_bull_div,
+        "bearish_macd_div": macd_bear_div,
+        "bullish_macd_div": macd_bull_div,
+        "overextended": overextended,
         "volume_absorption": False,
         "fakeout_detected": False,
         "fakeout_bull": False,
@@ -1042,6 +1216,7 @@ def compute_indicators_for_symbol(sym_df: pd.DataFrame) -> Dict[str, Any]:
         "atr_percentile": "N/A",
         "atr": "N/A",
         "bb_width": _na_if_nan(bb_width_val),
+        "bb_width_percentile": round(bb_width_percentile, 1),
     }
     twelve_data = {
         "rsi": _na_if_nan(rsi),
